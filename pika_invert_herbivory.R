@@ -242,7 +242,7 @@ model_additive = lme(Lselect ~ damage + species, random = ~1|haypileID,
   summary(model_additive)
   anova(model_additive)
 
-emmeans(model_interaction, pairwise ~ species) # identify which species differ in selection
+emmeans(model_additive, pairwise ~ species) # identify which species differ in selection
 emmeans(model_additive, ~ damage) # report estimated marginal means for damage
 
 
