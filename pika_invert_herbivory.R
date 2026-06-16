@@ -2,16 +2,17 @@
 #         INTERACTIONS BETWEEN PIKA AND INVERTEBRATE HERBIVORY
 #                   Isabel C Barrio (isabel@lbhi.is)
 #               based on old R scripts from Kristen Peck
-#                        last update 24.05.2026
+#                        last update 16.06.2026
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 # libraries ---- 
 library(readxl)          # to import data directly from Excel
+library(writexl)         # to write out Excel files
 library(openxlsx)        # to write out Excel files and format tables
 library(tidyverse)
 library(nlme)
 library(emmeans)         # calculate estimated marginal means
-library(performance)     # calculate intraclass correlation
+library(performance)     # calculate intraclass correlation and R2
 
 
 # load and tidy up data ---- 
@@ -49,6 +50,8 @@ haypiles <- read_excel("data/pika_invert_herbivory.xlsx", sheet = "haypiles_ORIG
               mutate(value = round(weight/total_weight, 6)) %>% 
               select(haypileID, index, species, damage, value, total_weight)
 
+haypiles %>% distinct(species) # 25 plant species/groups
+
 
 # data on point intercept surveys of meadow (= available to pikas)
 point_intercept_long <- read_excel("data/pika_invert_herbivory.xlsx", sheet = "point_intercept_ORIGINAL") %>% 
@@ -77,12 +80,14 @@ point_intercept_long <- read_excel("data/pika_invert_herbivory.xlsx", sheet = "p
              select(haypileID, quadratID, species, damage, point, value, n_intercepts) 
 
 point_intercept <- point_intercept_long %>%
-             # calculate number of hits per haypile, and calculate cover
+             # calculate number of hits per haypile and cover
              group_by(haypileID, species, damage, n_intercepts) %>%
                 summarise(hits = sum(value, na.rm = TRUE), .groups = "drop") %>% ungroup() %>% 
              mutate(value = round(hits/n_intercepts, 6),
                     index = "avail") %>% # indicate that these values are for availability
              select(haypileID, index, species, damage, value)
+
+point_intercept %>% distinct(species) # 54 plant species/groups
 
 # check how many haypiles are included in each dataset
 point_intercept %>% distinct(haypileID) %>% print(n=30) # 30 haypiles
@@ -90,9 +95,13 @@ haypiles %>% distinct(haypileID) %>% print(n=35)        # 31 haypiles; drop E CC
 
 
 # combine use and availability datasets
-use_avail <- haypiles %>% bind_rows(point_intercept) %>% 
-  pivot_wider(names_from = index, values_from = value) %>% 
-  # chech that information is available in both datasets (haypiles and point_intercept)
+use_avail <- haypiles %>% rename(use = value) %>%
+  select(haypileID, species, damage, use) %>%
+  full_join(point_intercept %>%
+              rename(avail = value) %>%
+                select(haypileID, species, damage, avail),
+            by = c("haypileID", "species", "damage")) %>% 
+  # check that information is available in both datasets (haypiles and point_intercept)
   # e.g. there was one more haypile in haypiles than in point intercept
   group_by(haypileID) %>% 
     mutate(total_use = sum(use, na.rm = T),
@@ -112,35 +121,126 @@ keep_species <- use_avail %>%
 
 use_avail_subset <- use_avail %>% 
     filter(species %in% keep_species) %>% 
-    # correct availability values (when use > 0)
-    mutate(avail = case_when(is.na(avail) & use > 0 ~ 0.001, # CHECK
-                             avail == 0 & use > 0 ~ 0.001, # CHECK
-                             TRUE ~ avail),
-           use = case_when(is.na(use) ~ 0, TRUE ~ use)) %>% 
-    # calculate selection ratios
-    mutate(select.ratio = (use/avail),
-           Lselect = log(select.ratio + 0.0001)) # CHECK
+    # correct use values: NAs should be zero (no use)
+        mutate(use = case_when(is.na(use) ~ 0, TRUE ~ use)) 
 
-# check to decide on which constant to use for the log transformation
-sort(round(use_avail_subset$select.ratio, 4))
+# what to do with the NAs in availability is a bit trickier
+# check how many cases: %>% filter(is.na(avail) & use > 0) # 88 observations out of 261 (34%)
+# check the distribution of NAs in availability across species (this info will go to Table S3)
+TableS3 <- use_avail_subset %>%
+  group_by(species) %>%
+  summarise(n = n(),
+            n_NA = sum(is.na(avail)),
+            prop_NA = n_NA / n) 
+write_xlsx(TableS3, "data/TableS3_NAs.xlsx", col_names = TRUE, format_headers = TRUE)
 
 
-# models
-model0_interaction = lme(Lselect ~ damage*species, random = ~1|haypileID, method="ML", data = use_avail_subset)
-model0_additive = lme(Lselect ~ damage + species, random = ~1|haypileID, method="ML", data = use_avail_subset)      
-  anova(model0_interaction, model0_additive)         # species*damage (0.29) 
-    summary(model0_interaction)
-      plot(model0_interaction) #doesn't look too bad ;)
-       
-model_interaction = lme(Lselect ~ damage*species, random = ~1|haypileID, method = "REML", data = use_avail_subset)
+# interesting patterns: Dryas and Salix spp have only 8% NAs
+# suggesting that they are available in the vegetation and commonly used by pikas
+# in turn, Polygonum bistorta, Salix reticulata and Vaccinium uliginosum
+# are frequently used but not captured by the point intercept. This could
+# indicate that they are patchily distributed and poorly sampled by point intercept
+
+# in any case, we could assign a very low availability to those cases 
+# (pikas actually used the species, so it has to be available)
+# since the sampling resolution is 100 or 200 intercepts, the minimum detectable cover 
+# is 0.01 or 0.005, but we can check the influence of this choice in the analyses
+# doing a sensitivity analysis
+
+# sensitivity analysis for the non-detected availability
+fit_model_avail_fix <- function(avail_c){
+  dat <- use_avail_subset %>%
+            mutate(avail2 = case_when(is.na(avail) ~ avail_c, 
+                                      avail == 0 ~ avail_c,
+                                      TRUE ~ avail),
+           select.ratio = use / avail2,
+           Lselect = log(select.ratio + 0.01))
+  lme(Lselect ~ damage * species, random = ~1|haypileID, data = dat)
+}
+
+models <- list(pc_0.001 = fit_model_avail_fix(0.001),
+               pc_0.005 = fit_model_avail_fix(0.005),
+               pc_0.01  = fit_model_avail_fix(0.01))
+
+    # compare fixed effects
+    lapply(models, anova)
+    
+    # compare p-value of the interaction
+    sapply(models, function(m)
+      anova(m)["damage:species","p-value"])
+    
+    # compare estimated effects (emmeans)
+    lapply(models, function(m)
+      emmeans(m, ~ damage | species))
+
+
+# one last check: 
+# run the model without avail = NA
+use_avail_noNAs <- use_avail_subset %>% 
+  filter(!is.na(avail) & !avail == 0) %>% 
+  mutate(Lselect = log((use/avail) + 0.01))
+
+model_interaction_noNAs <- lme(Lselect ~ damage * species, 
+                               random = ~1|haypileID, data = use_avail_noNAs)
+anova(model_interaction_noNAs)
+
+
+# the other decision we have to make is about the constant to be added to the log
+# we can again run sensitivity analysis to see how that choice affects the results
+fit_model_log <- function(k){
+  dat <- use_avail_subset %>%
+    mutate(avail2 = case_when(is.na(avail) ~ 0.001, 
+                                      avail == 0 ~ 0.001,
+                                      TRUE ~ avail),
+           select.ratio = use / avail2,
+           Lselect = log(select.ratio + k))
+  nlme::lme(Lselect ~ damage * species, random = ~1|haypileID,
+    method = "REML", data = dat)
+}
+
+models <- list(k0.1   = fit_model_log(0.1),
+                k0.01  = fit_model_log(0.01),
+                k0.001 = fit_model_log(0.001))
+
+    # compare fixed effects
+    lapply(models, anova)
+    
+    # compare p-value of the interaction
+    sapply(models, function(m)
+      anova(m)["damage:species","p-value"])
+    
+    # compare estimated effects (emmeans)
+    lapply(models, function(m)
+      emmeans(m, ~ damage | species))
+
+
+# results are robust to these choices, so we're good - we will use 0.001 for avail
+# and add 0.01 to the selection ratio
+use_avail_data <- use_avail_subset %>%
+    mutate(avail2 = case_when(is.na(avail) ~ 0.001, 
+                              avail == 0 ~ 0.001,
+                                TRUE ~ avail),
+           select.ratio = use / avail2,
+           Lselect = log(select.ratio + 0.01))
+
+
+
+
+# models ----
+model_interaction = lme(Lselect ~ damage*species, random = ~1|haypileID, 
+                        method = "REML", data = use_avail_data)
   summary(model_interaction)
+  anova(model_interaction) # species*damage (0.312) 
+    plot(model_interaction) 
 
 emmeans(model_interaction, pairwise ~ damage | species) 
   # since the interaction is not significant, we need to treat these results carefully
 
 
-model_additive = lme(Lselect ~ damage + species, random = ~1|haypileID, method = "REML", data = use_avail_subset)
+model_additive = lme(Lselect ~ damage + species, random = ~1|haypileID, 
+                     method = "REML", data = use_avail_data)
   summary(model_additive)
+  anova(model_additive)
 
 emmeans(model_interaction, pairwise ~ species) # identify which species differ in selection
 emmeans(model_additive, ~ damage) # report estimated marginal means for damage
@@ -167,10 +267,9 @@ ggplot(data.frame(resid = resid(model_additive),
 
 ## intraclass correlation (ICC) - how correlated are observations from the same pika
 # ICC = variance among pikas / variance among pikas + residual variance
+VarCorr(model_interaction)
 
-VarCorr(model_additive)
-
-vc <- VarCorr(model_additive)
+vc <- VarCorr(model_interaction)
   var_haypile <- as.numeric (vc[1, "Variance"])
   var_resid <- as.numeric(vc[nrow(vc), "Variance"])
   (ICC <- var_haypile / (var_haypile + var_resid))
@@ -179,18 +278,18 @@ vc <- VarCorr(model_additive)
 # (the rest up to 1 is the variance within haypiles)
   
 # alternatively we can use the function icc in the performance package
-icc(modelAb.final)  
+icc(model_interaction)  
 
 
 # we can also calculate marginal and conditional R2 (Nakagawa & Schielzeth, 2013)
 # also with the performance package
-r2_nakagawa(model_additive)
+r2_nakagawa(model_interaction)
 
 # marginal R2 is the variance explained by the fixed effects only
 # conditional R2 is the variance explained by fixed and random effects
 
-# in our case marginal R2 0.206 --> 21% explained by species*damage
-# conditional R2 0.324 --> about 12% explained by the random effect (haypileID)
+# in our case marginal R2 0.242 --> 24% explained by species*damage
+# conditional R2 0.298 --> about 5% explained by the random effect (haypileID)
 
 
 
@@ -198,7 +297,7 @@ r2_nakagawa(model_additive)
 # plot raw values and estimated marginal means
 emm <- as.data.frame(emmeans(model_interaction, ~ species*damage))          
 
-n <- use_avail_subset %>%
+n <- use_avail_data %>%
   group_by(species, damage) %>%
   summarise(n = n_distinct(haypileID), .groups = "drop")
 
@@ -206,7 +305,7 @@ emm <- left_join(emm, n, by = c("species", "damage"))
 
 
 # plot
-ggplot(use_avail_subset, aes(x = species, y = Lselect, colour = damage)) +
+Fig1 <- ggplot(use_avail_data, aes(x = species, y = Lselect, colour = damage)) +
   # horizontal reference line
   geom_hline(yintercept = 0, linetype = "solid") +
   # raw data points
@@ -221,7 +320,7 @@ ggplot(use_avail_subset, aes(x = species, y = Lselect, colour = damage)) +
     width = 0, linewidth = 0.8, position = position_dodge(width = 0.5)) +
   # sample sizes
   geom_text(data = emm,
-    aes(y = min(use_avail_subset$Lselect) - 0.5, label = paste0("n=", n), group = damage), colour = "black",
+    aes(y = min(use_avail_data$Lselect) - 0.5, label = paste0("n=", n), group = damage), colour = "black",
     position = position_dodge(width = 0.5), 
     size = 3, show.legend = FALSE) +
   scale_colour_manual(values = c("damaged"   = "#482878",
@@ -239,9 +338,11 @@ ggplot(use_avail_subset, aes(x = species, y = Lselect, colour = damage)) +
     theme(axis.text.x = element_text(face = "italic"),
           legend.position = "bottom")
   
+ggsave("figures/Figure1.png", plot = Fig1, width = 8, height = 4, dpi = 300)
+
 
 # alternatively we could have violin plots
-ggplot(use_avail_subset, aes(x = species, y = Lselect, fill = damage)) +
+ggplot(use_avail_data, aes(x = species, y = Lselect, fill = damage)) +
   # horizontal reference line
   geom_hline(yintercept = 0, linetype = "solid") +
   geom_violin(position = position_dodge(width = 0.9),
@@ -261,7 +362,7 @@ ggplot(use_avail_subset, aes(x = species, y = Lselect, fill = damage)) +
 # species effect on Lselect
 emm_species <- as.data.frame(emmeans(model_additive, ~ species))          
 
-n_species <- use_avail_subset %>%
+n_species <- use_avail_data %>%
   group_by(species) %>%
   summarise(n = n_distinct(haypileID), .groups = "drop")
 
@@ -269,7 +370,7 @@ emm_species <- left_join(emm_species, n_species, by = c("species"))
 
 
 # plot
-ggplot(use_avail_subset, aes(x = species, y = Lselect)) +
+FigS1 <- ggplot(use_avail_data, aes(x = species, y = Lselect)) +
   # horizontal reference line
   geom_hline(yintercept = 0, linetype = "solid") +
   # raw data points
@@ -283,7 +384,7 @@ ggplot(use_avail_subset, aes(x = species, y = Lselect)) +
     width = 0, linewidth = 0.8) +
   # sample sizes
   geom_text(data = emm_species,
-    aes(y = min(use_avail_subset$Lselect) - 0.5, label = paste0("n=", n)), colour = "black",
+    aes(y = min(use_avail_data$Lselect) - 0.5, label = paste0("n=", n)), colour = "black",
     size = 3) +
   scale_x_discrete(labels = c("dryas" = "Dryas\noctopetala",
                              "polbis" = "Polygonum\nbistorta",
@@ -297,6 +398,7 @@ ggplot(use_avail_subset, aes(x = species, y = Lselect)) +
     theme(axis.text.x = element_text(face = "italic"),
           legend.position = "bottom")
 
+ggsave("figures/FigureS1.png", plot = FigS1, width = 6, height = 4, dpi = 300)
 
 
 
@@ -329,7 +431,11 @@ haypile_summary <- haypiles_30 %>%
                                    species == "vacvit"     ~ "Vaccinium vitis-idaea",
                                    species == "petfri"     ~ "Petasites frigidus",
                                    species == "castet" ~ "Cassiope tetragona",
-                                    TRUE ~ "Other")) %>%  # there should be no "Other" ;)
+                                    TRUE ~ "Other"))  # there should be no "Other" ;)
+
+haypile_summary %>% distinct(species_group) # 12 groups
+
+haypile_summary_table <- haypile_summary %>%
   # calculate proportional biomass in haypile (irrespective of damage)
   group_by(HP, species_group) %>%
     summarise(prop_weight = sum(value), .groups = "drop") %>% 
@@ -346,58 +452,31 @@ haypile_summary <- haypiles_30 %>%
   arrange(species_group)
 
 # calculate the proportion damaged and extract total weight
-damage_row <- haypiles_30 %>% 
-  # add shorter haypile names
-  left_join(haypile_lookup, by = "haypileID") %>% 
-  # make sure order is correct
-    mutate(HP = factor(HP, levels = haypile_lookup$HP)) %>% 
+damage_row <- haypile_summary %>% 
   group_by(HP) %>%
   summarise(prop_damaged = sum(value[damage == "damaged"]), .groups = "drop") %>%
+    #summarise(mean = mean(prop_damaged), se = sd(prop_damaged)/sqrt(n()), min = min(prop_damaged), max = max(prop_damaged))
   pivot_wider(names_from = HP,
               values_from = prop_damaged) %>%
   mutate(species_group = "Proportion damaged") %>%
   relocate(species_group)
 
-biomass_row <- haypiles_30 %>% 
-  # add shorter haypile names
-  left_join(haypile_lookup, by = "haypileID") %>% 
-  # make sure order is correct
-    mutate(HP = factor(HP, levels = haypile_lookup$HP)) %>% 
+biomass_row <- haypile_summary %>% 
   group_by(HP) %>%
-  summarise(total_biomass = first(total_weight)) %>%
+  summarise(total_biomass = first(total_weight), .groups = "drop") %>%
+    #summarise(mean = mean(total_biomass), se = sd(total_biomass)/sqrt(n()), min = min(total_biomass), max = max(total_biomass))
   pivot_wider(names_from = HP,
               values_from = total_biomass) %>%
   mutate(species_group = "Total biomass (g)") %>%
   relocate(species_group)
 
 # combine all
-final_table <- bind_rows(haypile_summary, damage_row, biomass_row) %>%
+final_table <- bind_rows(haypile_summary_table, damage_row, biomass_row) %>%
   # round to three decimals
   mutate(across(-species_group, ~ round(.x, 3)))
 
 # create a damage-indicator matrix for grey shading
-damage_present <- haypiles_30 %>% 
-  # add shorter haypile names
-  left_join(haypile_lookup, by = "haypileID") %>% 
-  # make sure order is correct
-    mutate(HP = factor(HP, levels = haypile_lookup$HP)) %>%
-  # pool species into broader groups
-  mutate(species_group = case_when(species == "dryas"  ~ "Dryas octopetala",
-                                   species == "polbis" ~ "Polygonum bistorta",
-                                   species == "polviv" ~ "Polygonum viviparum",
-                                   species == "salret" ~ "Salix reticulata",
-                                   species == "salsp"  ~ "Salix spp.",
-                                   species == "vaculi" ~ "Vaccinium uliginosum",
-                                   species %in% c("aneparv","pedic","potbif","potvil",
-                                        "oxynig","saxbro","antenn","parrya",
-                                        "stellon","camp","oxydyg","artarc",
-                                        "astragalus", "forbs") ~ "Other forbs",
-                                   species == "graminoids" ~ "Graminoids",
-                                   species == "lich_moss"  ~ "Lichens and mosses",
-                                   species == "vacvit"     ~ "Vaccinium vitis-idaea",
-                                   species == "petfri"     ~ "Petasites frigidus",
-                                   species == "castet" ~ "Cassiope tetragona",
-                                    TRUE ~ "Other")) %>%  # there should be no "Other" ;)
+damage_present <- haypile_summary %>% 
   group_by(HP, species_group) %>%
     summarise(damage_present = any(damage == "damaged" & value > 0), .groups = "drop") %>% 
   # make wider table
@@ -461,8 +540,10 @@ point_damage <- point_intercept_long %>%
                 summarise(n_intercepts = first(n_intercepts),
                           n_damaged = sum(damaged_point),
                           prop_damaged = n_damaged / n_intercepts,
-                          .groups = "drop")
-
+                          .groups = "drop")  
+              #summarise(mean = mean(prop_damaged), se = sd(prop_damaged)/sqrt(n()), min = min(prop_damaged), max = max(prop_damaged))
+  
+# create shorter haypile names as above
 point_lookup <- tibble(haypileID = unique(point_intercept_long$haypileID),
   HP = paste0("HP", seq_along(unique(point_intercept_long$haypileID))))
 
@@ -539,7 +620,6 @@ point_summary <- point_intercept_long %>%
   left_join(species_lookup, by = "species") %>%
     mutate(species = species_name) %>% select(-species_name)
   
-
 # define order of species for the rows
 priority_species <- c("Dryas octopetala", "Polygonum bistorta", "Polygonum viviparum",
                       "Salix reticulata", "Salix spp.", "Vaccinium uliginosum")
@@ -550,7 +630,6 @@ species_order <- c(priority_species, other_species)
 point_summary <- point_summary %>% 
   mutate(species = factor(species, levels = species_order)) %>%
   arrange(species)
-
 
 # calculate the proportion damaged and extract total weight
 damage_row_PI <- point_damage %>%
@@ -605,13 +684,12 @@ damage_points <- damage_points %>%
   arrange(species)
 
 
-
 # export to Excel applying the conditional formatting :)
 wb2 <- createWorkbook()
   addWorksheet(wb2, "Summary")
   addWorksheet(wb2, "Damage")
 
-writeData(wb2, "Summary", point_summary)
+writeData(wb2, "Summary", final_table_PI)
 writeData(wb2, "Damage", damage_points)
 
 # create grey fill style
@@ -642,46 +720,3 @@ saveWorkbook(wb2, "data/TableS2_point_intercept_summary.xlsx", overwrite = TRUE)
 
 
 
-
-
-
-
-
-
-
-
-####Figure 2 -- species selection
-par(mfrow=c(1,1))
-par(mai=c(2,3,1,2))
-
-model.all.lmm1=lme(Lselect~fSPP-1, random=~1|fPIKA, method="REML", data=datos)
-summary(model.all.lmm1)
-
-#get means and SEs from there :)
-means.logselect <- c(-1.137,-1.562,0.232)
-ci.logselect <- (1.96*(c(0.292,0.305,0.291)))
-
-var.names <- c("Dryas octopetala", "Polygonum viviparum", "Salix spp.")
-
-library(arm)
-coefplot(means.logselect, sds=ci.logselect, CI=1,varnames=var.names,cex.var=1.2,
-         main="Log selection ratios",cex.pts=2)
-
-library(nlme)
-dryas <- subset(datos, datos$fSPP=="dryas")
-  model.dryas.lmm1=lme(Lselect~fDAM, random=~1|fPIKA, method="REML", data=dryas)
-  summary(model.dryas.lmm1)
-
-polviv <- subset(datos, datos$fSPP=="polviv")
-  model.polviv.lmm1=lme(Lselect~fDAM, random=~1|fPIKA, method="REML", data=polviv)
-  summary(model.polviv.lmm1)
-
-salsp <- subset(datos, datos$fSPP=="salsp")
-  model.salsp.lmm1=lme(Lselect~fDAM, random=~1|fPIKA, method="REML", data=salsp)
-  summary(model.salsp.lmm1)
-
-
-
-    
-    
-    
