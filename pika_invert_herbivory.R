@@ -13,6 +13,7 @@ library(tidyverse)
 library(nlme)
 library(emmeans)         # calculate estimated marginal means
 library(performance)     # calculate intraclass correlation and R2
+library(patchwork)       # combine plots into multipanel figure
 
 
 # load and tidy up data ---- 
@@ -89,6 +90,22 @@ point_intercept <- point_intercept_long %>%
 
 point_intercept %>% distinct(species) # 54 plant species/groups
 
+# location of point intercept quadrats
+read_excel("data/pika_invert_herbivory.xlsx", sheet = "point_intercept_ORIGINAL") %>%
+  filter(!is.na(date)) %>% 
+  # create long string unique to each point intercept frame
+  mutate(quadratID = paste0(haypileID, "_", dist_from_haypile, "_", 
+                            angle_from_haypile, "_", distance_from_talus)) %>%
+  group_by(quadratID) %>% 
+  summarise(dist = first(distance_from_talus), .groups = "drop") %>% 
+  filter(!dist == "?") %>% 
+  summarise(n = n_distinct(quadratID),
+            mean = mean(as.numeric(dist)),
+            se = sd(as.numeric(dist))/sqrt(n),
+            min = min(as.numeric(dist)),
+            max = max(as.numeric(dist)))
+  
+
 # check how many haypiles are included in each dataset
 point_intercept %>% distinct(haypileID) %>% print(n=30) # 30 haypiles
 haypiles %>% distinct(haypileID) %>% print(n=35)        # 31 haypiles; drop E CC13 N10 E15
@@ -141,6 +158,7 @@ write_xlsx(TableS3, "data/TableS3_NAs.xlsx", col_names = TRUE, format_headers = 
 # are frequently used but not captured by the point intercept. This could
 # indicate that they are patchily distributed and poorly sampled by point intercept
 
+# sensitivity analyses ----
 # in any case, we could assign a very low availability to those cases 
 # (pikas actually used the species, so it has to be available)
 # since the sampling resolution is 100 or 200 intercepts, the minimum detectable cover 
@@ -214,6 +232,7 @@ models <- list(k0.1   = fit_model_log(0.1),
       emmeans(m, ~ damage | species))
 
 
+    
 # results are robust to these choices, so we're good - we will use 0.001 for avail
 # and add 0.01 to the selection ratio
 use_avail_data <- use_avail_subset %>%
@@ -370,7 +389,7 @@ emm_species <- left_join(emm_species, n_species, by = c("species"))
 
 
 # plot
-FigS1 <- ggplot(use_avail_data, aes(x = species, y = Lselect)) +
+FigS1_species <- ggplot(use_avail_data, aes(x = species, y = Lselect)) +
   # horizontal reference line
   geom_hline(yintercept = 0, linetype = "solid") +
   # raw data points
@@ -393,12 +412,50 @@ FigS1 <- ggplot(use_avail_data, aes(x = species, y = Lselect)) +
                              "salsp" = "Salix sp.",
                              "vaculi" = "Vaccinium\nuliginosum")) +
   labs(x = NULL,
-       y = "Log selection ratio") +
+       y = "Log selection ratio",
+       title = "a) Species effect") +
   theme_bw() +
     theme(axis.text.x = element_text(face = "italic"),
           legend.position = "bottom")
 
-ggsave("figures/FigureS1.png", plot = FigS1, width = 6, height = 4, dpi = 300)
+# damage effect on Lselect
+emm_damage <- as.data.frame(emmeans(model_additive, ~ damage))          
+
+n_damage <- use_avail_data %>%
+  group_by(damage) %>%
+  summarise(n = n_distinct(haypileID), .groups = "drop")
+
+emm_damage <- left_join(emm_damage, n_damage, by = c("damage"))
+
+FigS1_damage <- ggplot(use_avail_data, aes(x = damage, y = Lselect)) +
+  # horizontal reference line
+  geom_hline(yintercept = 0, linetype = "solid") +
+  # raw data points
+  geom_jitter(colour = "grey70", alpha = 0.5,
+              size = 2, width = 0.15) +
+  # estimated marginal means
+  geom_point(data = emm_damage, aes(y = emmean), size = 4, colour = "black") +
+  # EMM confidence intervals
+  geom_errorbar(data = emm_damage,
+    aes(y = emmean, ymin = lower.CL, ymax = upper.CL),
+    width = 0, linewidth = 0.8) +
+  # sample sizes
+  geom_text(data = emm_damage,
+    aes(y = min(use_avail_data$Lselect) - 0.5, label = paste0("n=", n)), colour = "black",
+    size = 3) +
+  labs(x = NULL,
+       y = "Log selection ratio",
+       title = "b) Damage effect") +
+  theme_bw() +
+    theme(legend.position = "none")
+
+
+FigS1 <- FigS1_species + FigS1_damage +
+          plot_layout(widths = c(3, 1)) +
+          plot_annotation(tag_levels = "a")
+
+
+ggsave("figures/FigureS1.png", plot = FigS1, width = 10, height = 5, dpi = 300)
 
 
 
