@@ -11,6 +11,8 @@ library(writexl)         # to write out Excel files
 library(openxlsx)        # to write out Excel files and format tables
 library(tidyverse)
 library(nlme)
+library(lme4)
+library(lmerTest)
 library(emmeans)         # calculate estimated marginal means
 library(performance)     # calculate intraclass correlation and R2
 library(patchwork)       # combine plots into multipanel figure
@@ -90,7 +92,7 @@ point_intercept <- point_intercept_long %>%
 
 point_intercept %>% distinct(species) # 54 plant species/groups
 
-# location of point intercept quadrats
+# location of point intercept quadrats - how far from talus edge?
 read_excel("data/pika_invert_herbivory.xlsx", sheet = "point_intercept_ORIGINAL") %>%
   filter(!is.na(date)) %>% 
   # create long string unique to each point intercept frame
@@ -309,7 +311,6 @@ r2_nakagawa(model_interaction)
 
 # in our case marginal R2 0.242 --> 24% explained by species*damage
 # conditional R2 0.298 --> about 5% explained by the random effect (haypileID)
-
 
 
 # Figure 1 ----
@@ -775,5 +776,126 @@ addStyle(wb2, "Summary",
 saveWorkbook(wb2, "data/TableS2_point_intercept_summary.xlsx", overwrite = TRUE)
     
 
+
+# alternative analyses: functional groups ----
+## models with functional groups ----
+# first create a column with functional group id
+use_avail_data <- use_avail_data |> 
+  mutate(fct_group = case_when(species == "dryas" ~ "evergreen",
+                               species %in% c("polbis", "polviv") ~ "forb",
+                               species %in% c("salret", "salsp", "vaculi") ~ "deciduous"))
+
+model_fct <- lmer(Lselect ~ damage * fct_group + (1 | haypileID) + (1 | species),
+  data = use_avail_data, REML = TRUE)
+  summary(model_fct)
+  anova(model_fct) # species*damage (0.092) 
+    plot(model_fct) 
+
+emmeans(model_fct, pairwise ~ damage | fct_group) 
+  # since the interaction is not significant, we need to treat these results carefully
+
+
+model_fct_additive <- lme(Lselect ~ damage + fct_group, random = ~1|haypileID, 
+                     method = "REML", data = use_avail_data)
+  summary(model_fct_additive)
+  anova(model_fct_additive)
+
+emmeans(model_fct_additive, pairwise ~ fct_group) # identify which functional groups differ in selection
+emmeans(model_fct_additive, ~ damage) # report estimated marginal means for damage
+
+
+# check model assumptions
+ER2 = residuals(model_fct_additive, type="normalized"); par(mfrow = c(1,2)); plot(model_fct_additive)
+  boxplot(ER2 ~ use_avail_data$fct_group); abline(0, 0, col =2 )
+  boxplot(ER2 ~ use_avail_data$damage); abline(0, 0, col = 2)
+
+# other residual checks: distribution of random intercepts
+  qqnorm(ranef(model_fct_additive)[[1]]); qqline(ranef(model_fct_additive)[[1]])
+  # with only 30 haypiles normality may not be perfect, but gross departures can be informative.
+
+# inspect residuals separately for each species × damage combination:
+ggplot(data.frame(resid = resid(model_fct_additive),
+                  fct_group = use_avail_data$fct_group,
+                  damage = use_avail_data$damage),
+      aes(fct_group, resid)) +
+  geom_boxplot() +
+  facet_wrap(~damage)
+  # functional groups seem to have (roughly) similar variances, so we're good :)
+
+
+
+## Figure S1_fct ----
+# functional group effect on Lselect
+emm_fct <- as.data.frame(emmeans(model_fct_additive, ~ fct_group))          
+
+n_fct <- use_avail_data %>%
+  group_by(fct_group) %>%
+  summarise(n = n_distinct(haypileID), .groups = "drop")
+
+emm_fct <- left_join(emm_fct, n_fct, by = c("fct_group"))
+
+
+# plot
+FigS1_fct_groups <- ggplot(use_avail_data, aes(x = fct_group, y = Lselect)) +
+  # horizontal reference line
+  geom_hline(yintercept = 0, linetype = "solid") +
+  # raw data points
+  geom_jitter(colour = "grey70", alpha = 0.5,
+              size = 2, width = 0.15) +
+  # estimated marginal means
+  geom_point(data = emm_fct, aes(y = emmean), size = 4, colour = "black") +
+  # EMM confidence intervals
+  geom_errorbar(data = emm_fct,
+    aes(y = emmean, ymin = lower.CL, ymax = upper.CL),
+    width = 0, linewidth = 0.8) +
+  # sample sizes
+  geom_text(data = emm_fct,
+    aes(y = min(use_avail_data$Lselect) - 0.5, label = paste0("n=", n)), colour = "black",
+    size = 3) +
+  scale_x_discrete(labels = c("deciduous" = "deciduous\nshrubs",
+                             "evergreen" = "evergreen\nshrubs",
+                             "forb" = "forbs")) +
+  labs(x = NULL,
+       y = "Log selection ratio",
+       title = "a) Functional group effect") +
+  theme_bw() +
+    theme(axis.text.x = element_text(face = "italic"),
+          legend.position = "bottom")
+
+# damage effect on Lselect
+emm_damage <- as.data.frame(emmeans(model_fct_additive, ~ damage))          
+
+n_damage <- use_avail_data %>%
+  group_by(damage) %>%
+  summarise(n = n_distinct(haypileID), .groups = "drop")
+
+emm_damage <- left_join(emm_damage, n_damage, by = c("damage"))
+
+FigS1_fct_damage <- ggplot(use_avail_data, aes(x = damage, y = Lselect)) +
+  # horizontal reference line
+  geom_hline(yintercept = 0, linetype = "solid") +
+  # raw data points
+  geom_jitter(colour = "grey70", alpha = 0.5,
+              size = 2, width = 0.15) +
+  # estimated marginal means
+  geom_point(data = emm_damage, aes(y = emmean), size = 4, colour = "black") +
+  # EMM confidence intervals
+  geom_errorbar(data = emm_damage,
+    aes(y = emmean, ymin = lower.CL, ymax = upper.CL),
+    width = 0, linewidth = 0.8) +
+  # sample sizes
+  geom_text(data = emm_damage,
+    aes(y = min(use_avail_data$Lselect) - 0.5, label = paste0("n=", n)), colour = "black",
+    size = 3) +
+  labs(x = NULL,
+       y = "Log selection ratio",
+       title = "b) Damage effect") +
+  theme_bw() +
+    theme(legend.position = "none")
+
+
+FigS1_fct <- FigS1_fct_groups + FigS1_fct_damage +
+          plot_layout(widths = c(3, 1)) +
+          plot_annotation(tag_levels = "a")
 
 
