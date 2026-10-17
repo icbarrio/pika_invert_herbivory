@@ -146,6 +146,7 @@ use_avail_subset <- use_avail %>%
 # what to do with the NAs in availability is a bit trickier
 # check how many cases: %>% filter(is.na(avail) & use > 0) # 88 observations out of 261 (34%)
 # check the distribution of NAs in availability across species (this info will go to Table S3)
+## Table S3----
 TableS3 <- use_avail_subset %>%
   group_by(species) %>%
   summarise(n = n(),
